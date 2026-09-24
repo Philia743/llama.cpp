@@ -1,0 +1,86 @@
+name: Build win-cuda sm120 (own, minimal)
+
+# 目的：拿到含官方 PR #214（prefill 2x）的 Windows CUDA 13.3 x64 二进制。
+# 与官方 release-prism.yml 的 windows-cuda 档的差异（都是"为什么快"）：
+#   1) -DCMAKE_CUDA_ARCHITECTURES=120 —— 只编我们的 RTX 5060 Laptop (Blackwell sm_120)。
+#      官方不指定该变量，CMake 用 CUDA 13.3 默认全架构列表，882 个目标里九成是别的显卡。
+#   2) 只编 llama-server / llama-bench / llama-cli（不编 examples/tools）。
+#   3) 单独一个 job，不 needs 任何其它平台 ⇒ 不受 ubuntu-cpu 等失败影响，直接出 release 资产。
+#   4) 自己算 tag（git short sha），不依赖仓库里的 get-tag-name 复合动作。
+#
+# 注：CUDA 运行库 DLL（cudart64_13.dll 等）不在本 zip 里，官方是单独一个 cudart zip；
+#     我们本机已从 prism-b10709 的官方发布里取到并校验过（CUDA 13.3 同版本，可复用）。
+
+on:
+  workflow_dispatch:
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+jobs:
+  win-cuda-sm120:
+    runs-on: windows-2022
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup CUDA 13.3
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.3'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Show target commit
+        shell: bash
+        run: |
+          echo "commit: $(git rev-parse HEAD)"
+          echo "branch: $(git rev-parse --abbrev-ref HEAD)"
+          grep -c "PTQ1_0" ggml/include/ggml.h || echo "ggml.h 里没有 PTQ1_0（不该发生）"
+
+      - name: Build (sm_120 only)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=120 ^
+            -DCMAKE_CUDA_FLAGS="-diag-suppress=221" ^
+            %CMAKE_ARGS%
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target llama-server llama-bench llama-cli
+
+      - name: Determine tag name
+        id: tag
+        shell: bash
+        run: echo "name=prism-sm120-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Pack artifacts
+        shell: cmd
+        run: |
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.3-x64-sm120.zip .\build\bin\Release\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.3-x64-sm120.zip
+          name: llama-bin-win-cuda-13.3-x64-sm120.zip
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.name }}" \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.tag.outputs.name }}" \
+            --notes "Own minimal build of branch prism (includes merged PR #214). Windows CUDA 13.3 x64, sm_120 only. CUDA runtime DLLs not included (reuse the official cudart-llama-bin-win-cuda-13.3-x64.zip)." \
+            "llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.3-x64-sm120.zip"
